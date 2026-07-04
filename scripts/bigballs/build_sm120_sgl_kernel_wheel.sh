@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 export MAX_JOBS="${MAX_JOBS:-24}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-24}"
 export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:--allow-unsupported-compiler}"
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0a}"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 cd "$REPO_ROOT/sgl-kernel"
 ./scripts/apply_bigballs_sm120_only_patch.sh
 rm -rf dist build
