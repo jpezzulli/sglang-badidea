@@ -58,26 +58,45 @@ That helper narrows CUDA codegen to the SM120 path, disables the duplicate
 keeps the CMake edits local to the working tree. Do not commit those generated
 CMake working-tree edits if the helper already applies them.
 
-## Patch FlashInfer generated cached-op parallelism
+## Patch FlashInfer runtime cached-op generator parallelism
 
-Patch the installed FlashInfer package in the active Python environment:
+The primary fix is to patch the installed FlashInfer runtime cached-op generator
+in the active Python environment. Modern FlashInfer writes runtime cached-op
+`build.ninja` files from the `flashinfer/jit` package, typically
+`flashinfer/jit/cpp_ext.py`; vendored files under `flashinfer/data/cccl/ci/` and
+`flashinfer/data/cutlass/examples/` are not runtime generators and are ignored by
+default.
+
+Preview the exact installed generator file(s) before editing:
+
+```bash
+/opt/bigballs/.venv/bin/python scripts/bigballs/patch_flashinfer_parallelism.py --dry-run --verbose
+```
+
+Apply the generator patch:
 
 ```bash
 /opt/bigballs/.venv/bin/python scripts/bigballs/patch_flashinfer_parallelism.py
 ```
 
-The patch targets installed FlashInfer Python generator/source files that emit
-hard-coded single-thread `nvcc --threads=1` or equivalent arguments. Future
-cached-op `build.ninja` files should then use the environment-controlled values
-instead of defaulting to single-thread CUDA compilation.
+After this patch, normal SGLang startup and request-time FlashInfer JIT should
+generate future `~/.cache/flashinfer/**/cached_ops/**/build.ninja` files with the
+aggressive local profile: `FLASHINFER_NVCC_THREADS=4` by default for generated
+`nvcc --threads` flags and `FLASHINFER_NINJA_JOBS=24` by default for runtime
+Ninja invocations. `MAX_JOBS=24` remains exported as a compatibility fallback.
+The patcher fails loudly if it can only find irrelevant vendored/example files,
+because patching those files does not change runtime cached-op builds.
 
-To patch already-generated cache files under `~/.cache/flashinfer/**/build.ninja`:
+Already-generated cache files are different: they are static `build.ninja` files
+under `~/.cache/flashinfer`. Keep the cache patcher as an optional fallback for
+existing caches only, not as the primary operating model:
 
 ```bash
 /opt/bigballs/.venv/bin/python scripts/bigballs/patch_flashinfer_cache_build_ninja.py
 ```
 
-The combined wrapper applies both steps:
+The combined wrapper applies the generator patch first, then applies the
+existing-cache fallback:
 
 ```bash
 scripts/bigballs/apply_flashinfer_parallelism_patch.sh
@@ -85,17 +104,20 @@ scripts/bigballs/apply_flashinfer_parallelism_patch.sh
 
 ## Prebuild existing FlashInfer cached ops
 
-After the server has generated cached-op directories, or after reproducing a
-runtime compile once, prebuild every existing FlashInfer cached-op directory with
-aggressive local defaults:
+Prebuild is optional acceleration for cache directories that already exist. It
+should not be required for correctness once the installed generator is patched,
+because normal SGLang launch/request paths should generate future cache builds
+with the aggressive profile automatically. To warm or repair existing
+FlashInfer cached-op directories, run:
 
 ```bash
 scripts/bigballs/prebuild_flashinfer_cached_ops.sh
 ```
 
-The helper patches existing `build.ninja` files first, then runs `ninja -j24` in
-each cache directory by default. Override with `FLASHINFER_CACHE_ROOT`,
-`FLASHINFER_NINJA_JOBS`, or `FLASHINFER_NVCC_THREADS` if needed.
+The helper patches existing `build.ninja` files first as a fallback, then runs
+`ninja -j24` in each cache directory by default. Override with
+`FLASHINFER_CACHE_ROOT`, `FLASHINFER_NINJA_JOBS`, or
+`FLASHINFER_NVCC_THREADS` if needed.
 
 ## Launch the NVFP4 smoke server
 
@@ -117,9 +139,11 @@ curl -s http://127.0.0.1:8011/v1/models | jq .
 curl -s http://127.0.0.1:8011/model_info | jq .
 ```
 
-The first real request may still trigger FlashInfer runtime cached-op generation;
-after that happens, rerun `scripts/bigballs/prebuild_flashinfer_cached_ops.sh` to
-make existing cache builds repeatable and parallel.
+The first real request may still trigger FlashInfer runtime cached-op generation.
+With the installed generator patched, that normal request-time build should use
+`FLASHINFER_NINJA_JOBS=24` and `FLASHINFER_NVCC_THREADS=4` defaults
+automatically. Rerun `scripts/bigballs/prebuild_flashinfer_cached_ops.sh` only if
+you want to warm or repair already-generated cache directories.
 
 ## Production guardrails
 
