@@ -970,8 +970,16 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill:
+            custom_mask_len = max_num_tokens * self.max_context_len
+            draft_tokens = getattr(self, "num_draft_tokens", None)
+            if draft_tokens is not None:
+                # Target-verify speculative CUDA graph masks include the
+                # draft-token tail: num_draft_tokens * (seq_len + num_draft_tokens).
+                custom_mask_len = max_num_tokens * (
+                    self.max_context_len + draft_tokens
+                )
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (custom_mask_len,),
                 dtype=torch.uint8,
                 device=self.device,
             )
