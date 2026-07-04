@@ -2,6 +2,7 @@
 # Scratch/local blackhouse helper: install and sanity-check local sglang-kernel.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 WHEEL="${1:-}"
 if [[ -z "$WHEEL" ]]; then

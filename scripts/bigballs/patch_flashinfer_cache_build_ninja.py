@@ -8,8 +8,7 @@ from pathlib import Path
 def patch(path: Path, nvcc_threads: str) -> bool:
     s = path.read_text()
     old = s
-    s = s.replace("--threads=1", f"--threads={nvcc_threads}")
-    s = s.replace("--threads 1", f"--threads {nvcc_threads}")
+    s = re.sub(r"--threads([= ]+)[0-9]+", lambda m: f"--threads{m.group(1)}{nvcc_threads}", s)
     s = re.sub(r"(?<![\w-])-j1(?!\d)", f"-j{os.environ.get('FLASHINFER_NINJA_JOBS','24')}", s)
     s = re.sub(r"(?<![\w-])-j 1(?!\d)", f"-j {os.environ.get('FLASHINFER_NINJA_JOBS','24')}", s)
     if s != old:

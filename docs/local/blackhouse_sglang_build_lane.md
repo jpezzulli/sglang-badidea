@@ -26,7 +26,7 @@ contents, or logs.
 Activate the local environment first, then export the build-lane defaults:
 
 ```bash
-source /opt/bigballs/bin/activate
+source /opt/bigballs/.venv/bin/activate
 export FLASHINFER_NINJA_JOBS=24
 export FLASHINFER_NVCC_THREADS=4
 export MAX_JOBS=24
@@ -44,10 +44,10 @@ into generated cached-op `build.ninja` files.
 From the repository root:
 
 ```bash
-PYTHON_BIN=/opt/bigballs/bin/python \
+PYTHON_BIN=/opt/bigballs/.venv/bin/python \
   scripts/bigballs/build_sm120_sgl_kernel_wheel.sh
 
-PYTHON_BIN=/opt/bigballs/bin/python \
+PYTHON_BIN=/opt/bigballs/.venv/bin/python \
   scripts/bigballs/install_check_sgl_kernel_wheel.sh
 ```
 
@@ -63,7 +63,7 @@ CMake working-tree edits if the helper already applies them.
 Patch the installed FlashInfer package in the active Python environment:
 
 ```bash
-/opt/bigballs/bin/python scripts/bigballs/patch_flashinfer_parallelism.py
+/opt/bigballs/.venv/bin/python scripts/bigballs/patch_flashinfer_parallelism.py
 ```
 
 The patch targets installed FlashInfer Python generator/source files that emit
@@ -74,7 +74,7 @@ instead of defaulting to single-thread CUDA compilation.
 To patch already-generated cache files under `~/.cache/flashinfer/**/build.ninja`:
 
 ```bash
-/opt/bigballs/bin/python scripts/bigballs/patch_flashinfer_cache_build_ninja.py
+/opt/bigballs/.venv/bin/python scripts/bigballs/patch_flashinfer_cache_build_ninja.py
 ```
 
 The combined wrapper applies both steps:

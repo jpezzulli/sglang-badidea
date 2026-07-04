@@ -9,7 +9,9 @@ export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-24}"
 export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:--allow-unsupported-compiler}"
 MODEL_PATH="${MODEL_PATH:-/srv/models/hf/bigballs}"
 PORT="${PORT:-8011}"
-python -m sglang.launch_server \
+PYTHON_BIN="${PYTHON_BIN:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+"$PYTHON_BIN" -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
   --load-format safetensors \
   --quantization modelopt_fp4 \
