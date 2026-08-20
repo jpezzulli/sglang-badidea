@@ -728,6 +728,7 @@ class HybridCacheController(BaseHiCacheController):
         hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
         while not self.storage_stop_event.is_set():
+            operation = None
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
@@ -736,6 +737,15 @@ class HybridCacheController(BaseHiCacheController):
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
+            except Exception:
+                logger.exception(
+                    "Hybrid storage backup failed for operation %s after %d "
+                    "completed tokens; preserving progress and continuing.",
+                    getattr(operation, "id", None),
+                    getattr(operation, "completed_tokens", 0),
+                )
+                if operation is not None:
+                    self.ack_backup_queue.put(operation)
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

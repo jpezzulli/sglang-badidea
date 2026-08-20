@@ -1289,6 +1289,7 @@ class HiCacheController:
         Manage backup operations from host memory to storage backend.
         """
         while not self.storage_stop_event.is_set():
+            operation = None
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
@@ -1300,3 +1301,12 @@ class HiCacheController:
 
             except Empty:
                 continue
+            except Exception:
+                logger.exception(
+                    "Storage backup failed for operation %s after %d completed "
+                    "tokens; preserving progress and continuing.",
+                    getattr(operation, "id", None),
+                    getattr(operation, "completed_tokens", 0),
+                )
+                if operation is not None:
+                    self.ack_backup_queue.put(operation)

@@ -1,11 +1,13 @@
 import ctypes
 import json
 import logging
+import math
 import os
 import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import requests
@@ -28,6 +30,8 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
+MOONCAKE_NO_AVAILABLE_HANDLE = -200
+DEFAULT_HYBRID_IO_BATCH_PAGES = 128
 
 logger = logging.getLogger(__name__)
 
@@ -394,10 +398,44 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            extra_config = extra_config or {}
+            self.put_retry_timeout_seconds = float(
+                extra_config.get("put_retry_timeout_seconds", 0.0)
+            )
+            self.put_retry_initial_backoff_seconds = float(
+                extra_config.get("put_retry_initial_backoff_seconds", 0.05)
+            )
+            self.put_retry_max_backoff_seconds = float(
+                extra_config.get("put_retry_max_backoff_seconds", 1.0)
+            )
+            self.hybrid_io_batch_pages = int(
+                extra_config.get("hybrid_io_batch_pages", DEFAULT_HYBRID_IO_BATCH_PAGES)
+            )
+            for name, value in (
+                ("put_retry_timeout_seconds", self.put_retry_timeout_seconds),
+                (
+                    "put_retry_initial_backoff_seconds",
+                    self.put_retry_initial_backoff_seconds,
+                ),
+                (
+                    "put_retry_max_backoff_seconds",
+                    self.put_retry_max_backoff_seconds,
+                ),
+            ):
+                if not math.isfinite(value):
+                    raise ValueError(f"{name} must be finite")
+            if self.put_retry_timeout_seconds < 0:
+                raise ValueError("put_retry_timeout_seconds must be non-negative")
+            if self.put_retry_initial_backoff_seconds < 0:
+                raise ValueError(
+                    "put_retry_initial_backoff_seconds must be non-negative"
+                )
+            if self.put_retry_max_backoff_seconds < 0:
+                raise ValueError("put_retry_max_backoff_seconds must be non-negative")
+            if self.hybrid_io_batch_pages <= 0:
+                raise ValueError("hybrid_io_batch_pages must be positive")
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
-                if extra_config
-                else False
             )
             self._use_group_semantics = (
                 self.enable_group_semantics
@@ -845,7 +883,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
+            ex = self._normalize_physical_results(
+                self._batch_exist(component_keys),
+                len(component_keys),
+                operation="exist",
+                failure_result=0,
+            )
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -881,6 +924,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
+        retry_deadline = (
+            time.monotonic() + self.put_retry_timeout_seconds
+            if is_set and self.put_retry_timeout_seconds > 0
+            else None
+        )
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
@@ -900,28 +948,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     key_strs, ptr_list, element_size_list
                 )
 
-            if is_set:
-                group_ids = (
-                    self._expand_group_ids(tagged_keys, key_multiplier)
-                    if self._can_use_group_semantics()
-                    else None
-                )
-                exist_result = self._batch_exist(key_strs)
-                io_results = [0 if state == 1 else -1 for state in exist_result]
-                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
-                    put_results = self._put_batch_zero_copy_impl(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
-                        self._filter_group_ids(group_ids, missing_idx),
+            group_ids = (
+                self._expand_group_ids(tagged_keys, key_multiplier)
+                if is_set and self._can_use_group_semantics()
+                else None
+            )
+            io_results = []
+            for page_start in range(0, len(keys), self.hybrid_io_batch_pages):
+                page_end = min(page_start + self.hybrid_io_batch_pages, len(keys))
+                object_start = page_start * key_multiplier
+                object_end = page_end * key_multiplier
+                batch_keys = key_strs[object_start:object_end]
+                batch_ptrs = ptr_list[object_start:object_end]
+                batch_sizes = element_size_list[object_start:object_end]
+
+                if is_set:
+                    exist_result = self._normalize_physical_results(
+                        self._batch_exist(batch_keys),
+                        len(batch_keys),
+                        operation="exist",
+                        failure_result=0,
                     )
-                    for i, res in zip(missing_idx, put_results):
-                        io_results[i] = res
-            else:
-                io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
-                )
+                    batch_results = [0 if state == 1 else -1 for state in exist_result]
+                    missing_idx = [
+                        i for i, state in enumerate(exist_result) if state != 1
+                    ]
+                    if missing_idx:
+                        put_results = self._put_batch_zero_copy_impl(
+                            [batch_keys[i] for i in missing_idx],
+                            [batch_ptrs[i] for i in missing_idx],
+                            [batch_sizes[i] for i in missing_idx],
+                            self._filter_group_ids(
+                                (
+                                    group_ids[object_start:object_end]
+                                    if group_ids is not None
+                                    else None
+                                ),
+                                missing_idx,
+                            ),
+                            retry_deadline=retry_deadline,
+                        )
+                        for i, result in zip(missing_idx, put_results):
+                            batch_results[i] = result
+                else:
+                    batch_results = self._normalize_physical_results(
+                        self._get_batch_zero_copy_impl(
+                            batch_keys, batch_ptrs, batch_sizes
+                        ),
+                        len(batch_keys),
+                        operation="get",
+                        failure_result=-1,
+                    )
+                io_results.extend(batch_results)
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
@@ -1044,6 +1122,32 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    @staticmethod
+    def _normalize_physical_results(
+        results: Any,
+        expected_count: int,
+        *,
+        operation: str,
+        failure_result: int,
+    ) -> List[int]:
+        """Fail closed when Mooncake returns an incomplete status vector."""
+        try:
+            normalized = list(results)
+        except TypeError:
+            normalized = []
+        if len(normalized) != expected_count or not all(
+            isinstance(result, Integral) for result in normalized
+        ):
+            logger.error(
+                "Mooncake %s returned a malformed status vector: expected %d "
+                "integer results, received %d.",
+                operation,
+                expected_count,
+                len(normalized),
+            )
+            return [failure_result] * expected_count
+        return [int(result) for result in normalized]
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1060,8 +1164,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
+        get_results = self._normalize_physical_results(
+            self._get_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes),
+            len(key_strs),
+            operation="get",
+            failure_result=-1,
         )
         end_time = time.perf_counter()
 
@@ -1292,6 +1399,137 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        group_ids: Optional[List[str]] = None,
+        retry_deadline: Optional[float] = None,
+    ) -> List[int]:
+        results = self._normalize_physical_results(
+            self._put_batch_zero_copy_once(
+                key_strs, buffer_ptrs, buffer_sizes, group_ids
+            ),
+            len(key_strs),
+            operation="put",
+            failure_result=-1,
+        )
+        pending = [
+            i
+            for i, result in enumerate(results)
+            if result == MOONCAKE_NO_AVAILABLE_HANDLE
+        ]
+        if not pending or self.put_retry_timeout_seconds == 0:
+            return results
+
+        started = time.monotonic()
+        deadline = (
+            retry_deadline
+            if retry_deadline is not None
+            else started + self.put_retry_timeout_seconds
+        )
+        delay = self.put_retry_initial_backoff_seconds
+        attempts = 0
+        initial_pending = len(pending)
+
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if delay > 0:
+                time.sleep(min(delay, remaining))
+
+            # A timed-out response can be ambiguous. Resolve already-created
+            # objects before retrying so a successful prior Put is never
+            # duplicated.
+            pending_keys = [key_strs[i] for i in pending]
+            exist_results = self._normalize_physical_results(
+                self._batch_exist(pending_keys),
+                len(pending_keys),
+                operation="exist",
+                failure_result=0,
+            )
+            retry_indices = []
+            for index, exists in zip(pending, exist_results):
+                if exists == 1:
+                    results[index] = 0
+                else:
+                    retry_indices.append(index)
+            if not retry_indices:
+                pending = []
+                break
+
+            retry_results = self._normalize_physical_results(
+                self._put_batch_zero_copy_once(
+                    [key_strs[i] for i in retry_indices],
+                    [buffer_ptrs[i] for i in retry_indices],
+                    [buffer_sizes[i] for i in retry_indices],
+                    (
+                        [group_ids[i] for i in retry_indices]
+                        if group_ids is not None
+                        else None
+                    ),
+                ),
+                len(retry_indices),
+                operation="put",
+                failure_result=-1,
+            )
+            attempts += 1
+            pending = []
+            for index, result in zip(retry_indices, retry_results):
+                results[index] = result
+                if result == MOONCAKE_NO_AVAILABLE_HANDLE:
+                    pending.append(index)
+
+            if self.put_retry_max_backoff_seconds > 0:
+                delay = min(
+                    max(delay * 2, self.put_retry_initial_backoff_seconds),
+                    self.put_retry_max_backoff_seconds,
+                )
+
+        if pending:
+            pending_keys = [key_strs[i] for i in pending]
+            exist_results = self._normalize_physical_results(
+                self._batch_exist(pending_keys),
+                len(pending_keys),
+                operation="exist",
+                failure_result=0,
+            )
+            still_pending = []
+            for index, exists in zip(pending, exist_results):
+                if exists == 1:
+                    results[index] = 0
+                else:
+                    still_pending.append(index)
+            pending = still_pending
+
+        elapsed = time.monotonic() - started
+        if pending:
+            logger.error(
+                "Mooncake put retry exhausted after %.2fs and %d attempts: "
+                "%d/%d objects still have no available handle.",
+                elapsed,
+                attempts,
+                len(pending),
+                initial_pending,
+            )
+        elif all(result == 0 for result in results):
+            logger.info(
+                "Mooncake put retry recovered %d objects in %d attempts over %.2fs.",
+                initial_pending,
+                attempts,
+                elapsed,
+            )
+        else:
+            logger.warning(
+                "Mooncake put retry ended with unresolved non-capacity failures "
+                "after %d attempts over %.2fs.",
+                attempts,
+                elapsed,
+            )
+        return results
+
+    def _put_batch_zero_copy_once(
         self,
         key_strs: List[str],
         buffer_ptrs: List[Any],

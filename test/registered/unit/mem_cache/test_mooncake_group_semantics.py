@@ -79,6 +79,10 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_put_responses = []
+            self.batch_put_default_result = 0
+            self.batch_get_calls = []
+            self.batch_get_responses = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -112,8 +116,25 @@ def _fake_store_class():
                     "args": args,
                 }
             )
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
+            results = (
+                list(self.batch_put_responses.pop(0))
+                if self.batch_put_responses
+                else [self.batch_put_default_result] * len(keys)
+            )
+            self.existing_keys.update(
+                key for key, result in zip(keys, results) if result == 0
+            )
+            return results
+
+        def batch_get_into(self, keys, ptrs, sizes):
+            self.batch_get_calls.append(
+                {"keys": list(keys), "ptrs": list(ptrs), "sizes": list(sizes)}
+            )
+            return (
+                list(self.batch_get_responses.pop(0))
+                if self.batch_get_responses
+                else [8] * len(keys)
+            )
 
         def batch_put_from_multi_buffers(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -125,8 +146,15 @@ def _fake_store_class():
                     "args": args,
                 }
             )
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
+            results = (
+                list(self.batch_put_responses.pop(0))
+                if self.batch_put_responses
+                else [0] * len(keys)
+            )
+            self.existing_keys.update(
+                key for key, result in zip(keys, results) if result == 0
+            )
+            return results
 
     return FakeMooncakeDistributedStore
 
@@ -206,12 +234,18 @@ def _make_config(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    put_retry_timeout_seconds=0,
+    hybrid_io_batch_pages=128,
 ):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
         "check_server": False,
         "global_segment_size": 1024 * 1024,
         "enable_group_semantics": enable_group_semantics,
+        "put_retry_timeout_seconds": put_retry_timeout_seconds,
+        "put_retry_initial_backoff_seconds": 0,
+        "put_retry_max_backoff_seconds": 0,
+        "hybrid_io_batch_pages": hybrid_io_batch_pages,
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
@@ -244,6 +278,8 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    put_retry_timeout_seconds=0,
+    hybrid_io_batch_pages=128,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -255,6 +291,8 @@ def _make_store(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_lcm_size=tp_lcm_size,
+        put_retry_timeout_seconds=put_retry_timeout_seconds,
+        hybrid_io_batch_pages=hybrid_io_batch_pages,
     )
 
     with patch.dict(
@@ -274,6 +312,61 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_retry_timeout_must_be_finite(self):
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            _make_store(put_retry_timeout_seconds=float("inf"))
+
+    def test_no_available_handle_retries_only_failed_keys(self):
+        store, fake_store = _make_store(put_retry_timeout_seconds=1)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_responses = [[0, -200, -200, 0], [0, 0]]
+
+        result = store.batch_set_v1(["page0", "page1"], torch.tensor([0, 1]))
+
+        self.assertEqual(result, [True, True])
+        self.assertEqual(len(fake_store.batch_put_calls), 2)
+        self.assertEqual(
+            fake_store.batch_put_calls[1]["keys"], ["page0_0_v", "page1_0_k"]
+        )
+        self.assertEqual(
+            fake_store.batch_put_calls[1]["args"][0].group_ids,
+            ["sglang-hicache:page0", "sglang-hicache:page1"],
+        )
+
+    def test_non_capacity_failure_is_not_retried(self):
+        store, fake_store = _make_store(put_retry_timeout_seconds=1)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_responses = [[0, -201]]
+
+        result = store.batch_set_v1(["page0"], torch.tensor([0]))
+
+        self.assertEqual(result, [False])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+
+    def test_capacity_retry_exhaustion_fails_closed(self):
+        store, fake_store = _make_store(put_retry_timeout_seconds=0.01)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_default_result = -200
+
+        result = store.batch_set_v1(["page0"], torch.tensor([0]))
+
+        self.assertEqual(result, [False])
+        self.assertGreater(len(fake_store.batch_put_calls), 1)
+
+    def test_capacity_retry_reconciles_existing_before_resend(self):
+        store, fake_store = _make_store(put_retry_timeout_seconds=1)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_responses = [[0, -200]]
+        exist_calls = iter([[0, 0], [1]])
+
+        with patch.object(
+            fake_store, "batch_is_exist", side_effect=lambda _: next(exist_calls)
+        ):
+            result = store.batch_set_v1(["page0"], torch.tensor([0]))
+
+        self.assertEqual(result, [True])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
@@ -451,6 +544,87 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_v2_io_is_batched_by_logical_pages(self):
+        store, fake_store = _make_store(is_mla_model=True, hybrid_io_batch_pages=2)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([0, 1, 2]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.INDEXER], [True, True, True])
+        self.assertEqual(len(fake_store.batch_put_calls), 2)
+        self.assertEqual(
+            fake_store.batch_put_calls[0]["keys"],
+            ["page0__indexer", "page1__indexer"],
+        )
+        self.assertEqual(fake_store.batch_put_calls[1]["keys"], ["page2__indexer"])
+
+    def test_v2_get_short_physical_result_fails_closed(self):
+        store, fake_store = _make_store(hybrid_io_batch_pages=2)
+        store.register_mem_host_pool_v2(
+            FakeHostKVCache(objects_per_page=2), PoolName.DRAFT
+        )
+        fake_store.batch_get_responses = [[8, 8, 8]]
+
+        result = store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.DRAFT], [False, False])
+
+    def test_v2_get_malformed_physical_result_fails_closed(self):
+        store, fake_store = _make_store()
+        store.register_mem_host_pool_v2(
+            FakeHostKVCache(objects_per_page=2), PoolName.DRAFT
+        )
+        fake_store.batch_get_responses = [[8, None]]
+
+        result = store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.DRAFT], [False])
+
+    def test_missing_draft_sidecar_removes_reusable_prefix(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store.register_mem_host_pool_v2(
+            FakeHostKVCache(objects_per_page=2), PoolName.DRAFT
+        )
+        fake_store.existing_keys.update({"page0_0_k", "page0_0_v"})
+
+        result = store.batch_exists_v2(
+            ["page0"],
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 0)
 
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(
