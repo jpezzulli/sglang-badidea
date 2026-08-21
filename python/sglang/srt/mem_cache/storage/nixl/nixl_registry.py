@@ -45,12 +45,11 @@ class NixlRegistry:
         self.agent = agent
         self.mem_type = mem_type
         self.file_manager = file_manager
-        # OBJ devIds key a process-wide map in the NIXL OBJ plugin
-        # (devIdToObjKey_) that is not protected by a lock, so concurrent
-        # OBJ registrations must use disjoint devId ranges. Allocate them
-        # from a single monotonic counter.
-        self._obj_devid_lock = threading.Lock()
-        self._obj_devid_next = 1
+        # Path-mode FILE and OBJ devIds key process-wide backend maps. Active
+        # registrations must use disjoint ranges, including across HiCache's
+        # concurrent backup and prefetch threads.
+        self._devid_lock = threading.Lock()
+        self._devid_next = 1
         self.path_mode = mem_type == "FILE" and self._probe_path_mode()
         if mem_type == "FILE" and self.path_mode:
             logger.info("HiCacheNixl: path-mode FILE registration active.")
@@ -130,6 +129,12 @@ class NixlRegistry:
         except Exception:
             return True
 
+    def _allocate_dev_ids(self, count: int) -> range:
+        with self._devid_lock:
+            base = self._devid_next
+            self._devid_next += count
+        return range(base, base + count)
+
     @contextmanager
     def storage(self, buffers, keys, direction):
         """Open + register the storage side; deregister and close fds on exit.
@@ -148,8 +153,10 @@ class NixlRegistry:
                 if self.file_manager.use_direct_io:
                     parts.append("direct")
                 spec = ",".join(parts)
+                dev_ids = self._allocate_dev_ids(len(keys))
                 tuples = [
-                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
+                    (0, sizes[i], dev_id, f"{spec}:{keys[i]}")
+                    for i, dev_id in enumerate(dev_ids)
                 ]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:
@@ -178,10 +185,7 @@ class NixlRegistry:
             # and unlocked). NIXL's pybind layer requires position 3 to be
             # int, hence the key goes in metaInfo (position 4).
             n = len(keys)
-            with self._obj_devid_lock:
-                base = self._obj_devid_next
-                self._obj_devid_next += n
-            dev_ids = list(range(base, base + n))
+            dev_ids = list(self._allocate_dev_ids(n))
             tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
             with self._registered(tuples, "OBJ") as reg:
                 if reg is None:
