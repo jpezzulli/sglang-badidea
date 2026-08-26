@@ -15,6 +15,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
@@ -641,6 +642,70 @@ class TestNixlUnified(CustomTestCase):
 
         self.assertEqual(results[PoolName.MAMBA], [True])
         self.assertTrue(torch.all(pool.get_data_page(0) == 3))
+
+    def test_batch_set_v2_chunks_large_bounce_backed_draft_pool(self):
+        page_count = STORAGE_BATCH_SIZE + 2
+        pool = MockHybridPool(num_pages=page_count, expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.DRAFT)
+
+        calls = []
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            calls.append((len(key_strs), direction))
+            self.assertLessEqual(len(host_buffers), STORAGE_BATCH_SIZE)
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=[f"p{i}" for i in range(page_count)],
+                    host_indices=torch.arange(page_count, dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.DRAFT], [True] * page_count)
+        self.assertEqual(
+            calls,
+            [(STORAGE_BATCH_SIZE, "WRITE"), (2, "WRITE")],
+        )
+
+    def test_batch_get_v2_chunks_large_bounce_backed_draft_pool(self):
+        page_count = STORAGE_BATCH_SIZE + 2
+        pool = MockHybridPool(num_pages=page_count, expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.DRAFT)
+
+        calls = []
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            calls.append((len(key_strs), direction))
+            ctx = self.hicache._hybrid_pool_ctx[PoolName.DRAFT]
+            fill_value = 7 if len(calls) == 1 else 9
+            ctx.bounce_get[: len(host_buffers)].fill_(fill_value)
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=[f"p{i}" for i in range(page_count)],
+                    host_indices=torch.arange(page_count, dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.DRAFT], [True] * page_count)
+        self.assertEqual(
+            calls,
+            [(STORAGE_BATCH_SIZE, "READ"), (2, "READ")],
+        )
+        self.assertTrue(torch.all(pool.get_data_page(0) == 7))
+        self.assertTrue(torch.all(pool.get_data_page(STORAGE_BATCH_SIZE - 1) == 7))
+        self.assertTrue(torch.all(pool.get_data_page(STORAGE_BATCH_SIZE) == 9))
+        self.assertTrue(torch.all(pool.get_data_page(page_count - 1) == 9))
 
     def test_batch_set_get_v2_distinguishes_same_key_by_pool_name(self):
         mamba_pool = MockHybridPool(expose_zero_copy=False)
