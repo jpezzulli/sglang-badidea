@@ -1,0 +1,49 @@
+{
+  "base_url": "http://127.0.0.1:8001",
+  "served_model": "pennyroyal",
+  "prompt_identity": "REPLACE-WITH-MODEL-AND-REPRESENTATION-NAME",
+  "prompt_target_chars": 240000,
+  "concurrency": 3,
+  "max_output_tokens": 512,
+  "reasoning_effort": "medium",
+  "seed": 20260826,
+  "minimum_backup_ratio": 0.9,
+  "minimum_restore_ratio": 0.9,
+  "maximum_variant_storage_hit_ratio": 0.1,
+  "backup_timeout_seconds": 300,
+  "request_timeout_seconds": 3600,
+  "ready_timeout_seconds": 1200,
+  "command_timeout_seconds": 900,
+  "require_variant": true,
+  "metrics": {
+    "storage_hit": {
+      "name": "sglang:prefill_effective_tokens_total",
+      "labels": {
+        "mode": "storage_hit"
+      }
+    },
+    "backup": {
+      "name": "sglang:backuped_tokens_total",
+      "labels": {
+        "storage_backend": "nixl"
+      }
+    }
+  },
+  "lifecycle": {
+    "stop": [
+      "/path/to/clean-stop-wrapper"
+    ],
+    "clear_original": [
+      "/path/to/clear-exact-selected-namespace-wrapper"
+    ],
+    "start_original": [
+      "/path/to/start-original-representation-wrapper"
+    ],
+    "start_variant": [
+      "/path/to/start-representation-variant-wrapper"
+    ],
+    "namespace_probe": [
+      "/path/to/print-selected-namespace-wrapper"
+    ]
+  }
+}
