@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 
 import torch
 
@@ -332,6 +333,38 @@ class TestNixlUnified(CustomTestCase):
             fds_before,
             "fd leak after register_memory failure mid-storage",
         )
+
+    def test_path_mode_file_registrations_use_disjoint_device_ids(self):
+        registry = self.hicache.registry
+        if not registry.path_mode:
+            self.skipTest("installed NIXL does not support path-mode FILE registration")
+
+        captured = []
+        original_registered = registry._registered
+
+        class _FakeRegistration:
+            def trim(self):
+                return self
+
+        @contextmanager
+        def capture_registered(items, mem_type):
+            captured.append([item[2] for item in items])
+            yield _FakeRegistration()
+
+        registry._registered = capture_registered
+        try:
+            with registry.storage(
+                [(0, 64), (0, 64)], ["first-a", "first-b"], "WRITE"
+            ):
+                with registry.storage(
+                    [(0, 64), (0, 64)], ["second-a", "second-b"], "READ"
+                ):
+                    pass
+        finally:
+            registry._registered = original_registered
+
+        self.assertEqual(len(captured), 2)
+        self.assertTrue(set(captured[0]).isdisjoint(captured[1]))
 
     def _assert_host_addrs_pre_registered(
         self, is_zero_copy_mode: bool, hicache: HiCacheNixl = None
